@@ -95,14 +95,24 @@ class Sample(db.Model):
     has_results_gbk: bool = db.Column(db.Boolean, nullable=False)
     has_results_zip: bool = db.Column(db.Boolean, nullable=False)
 
+    def results_dir(self) -> str:
+        return f"{_get_basepath(self.date)}/results"
+
+    def results_file_path(self, filetype: str) -> str:
+        return f"{self.results_dir()}/{self.primary_key}_{self.name}.{filetype}"
+
 
 def _samples_this_week(current_date: datetime.date):
     start_of_week = get_start_of_week(current_date)
-    return db.session.execute(
-        db.select(Sample)
-        .filter(Sample.date >= start_of_week)
-        .filter(Sample.date < start_of_week + datetime.timedelta(weeks=1))
-    ).all()
+    return (
+        db.session.execute(
+            db.select(Sample)
+            .filter(Sample.date >= start_of_week)
+            .filter(Sample.date < start_of_week + datetime.timedelta(weeks=1))
+        )
+        .scalars()
+        .all()
+    )
 
 
 def _count_samples_this_week(current_date: datetime.date) -> int:
@@ -127,16 +137,15 @@ def remaining_samples_this_week(
     return {"remaining": remaining, "message": message}
 
 
-def _write_samples_as_tsv_this_week(
-    data_path: str, current_date: Optional[datetime.date] = None
-) -> str:
-    current_samples = _samples_this_week(current_date)
-    logger.info(current_samples)
-    if current_date is None:
-        current_date = datetime.date.today()
-    year, week, day = current_date.isocalendar()
-    filename = f"{data_path}/{year}/{week}/inputs/samples.tsv"
-    logger.info(f"Updating {filename}...")
+def _get_basepath(current_date: datetime.date) -> str:
+    year, week, _ = current_date.isocalendar()
+    data_path = flask.current_app.config["CIRCUITSEQ_DATA_PATH"]
+    return f"{data_path}/{year}/{week}"
+
+
+def _write_samples_as_tsv_this_week(current_date: datetime.date) -> None:
+    filename = f"{_get_basepath(current_date)}/inputs/samples.tsv"
+    logger.info(f"Generating {filename}")
     with open(filename, "w", newline="") as tsv_file:
         writer = csv.writer(tsv_file, delimiter="\t", lineterminator="\n")
         columns = [
@@ -148,24 +157,21 @@ def _write_samples_as_tsv_this_week(
             "concentration",
         ]
         writer.writerow(columns)
-        for sample_tuple in current_samples:
-            sample = sample_tuple[0]
+        for sample in _samples_this_week(current_date):
             logger.info(f"  - {sample.primary_key}")
             writer.writerow([getattr(sample, column) for column in columns])
-    return filename
 
 
-def update_samples_zipfile(
-    data_path: str, current_date: Optional[datetime.date] = None
-) -> str:
-    year, week, day = datetime.date.today().isocalendar()
-    base_path = pathlib.Path(f"{data_path}/{year}/{week}")
-    pathlib.Path(f"{base_path}/inputs").mkdir(parents=True, exist_ok=True)
-    tsv_file = _write_samples_as_tsv_this_week(data_path, current_date)
-    logger.info(f"  -> {tsv_file}")
-    logger.info(f"Creating zip file of {base_path}/inputs..")
+def update_samples_zipfile(current_date: Optional[datetime.date] = None) -> str:
+    if current_date is None:
+        current_date = datetime.date.today()
+    base_path = _get_basepath(current_date)
+    inputs_dir = f"{base_path}/inputs"
+    pathlib.Path(inputs_dir).mkdir(parents=True, exist_ok=True)
+    _write_samples_as_tsv_this_week(data_path, current_date)
+    logger.info(f"Creating zip file of {inputs_dir}..")
     zip_filename = shutil.make_archive(
-        base_name=str(base_path / "samples"),
+        base_name=f"{base_path}/samples",
         format="zip",
         root_dir=f"{base_path}/inputs",
     )
@@ -173,94 +179,143 @@ def update_samples_zipfile(
     return zip_filename
 
 
-def _results_dir_and_key_from_filename(
-    filename: str, data_path: str
-) -> Tuple[str, str]:
-    segments = pathlib.Path(filename).name.split("_")
-    if len(segments) < 3:
-        return "", ""
-    yy = segments[0]
-    ww = segments[1]
-    nn = segments[2]
-    return f"{data_path}/20{yy}/{ww}/results", f"{yy}_{ww}_{nn}"
+def get_samples(email: Optional[str] = None) -> Dict[str, List[Sample]]:
+    samples = {}
+    start_of_week = get_start_of_week()
+    selected_samples = db.select(Sample).order_by(db.desc("date"))
+    if email is not None:
+        selected_samples = selected_samples.filter(Sample.email == email)
+    samples["current_samples"] = (
+        db.session.execute(selected_samples.filter(Sample.date >= start_of_week))
+        .scalars()
+        .all()
+    )
+    samples["previous_samples"] = (
+        db.session.execute(selected_samples.filter(Sample.date < start_of_week))
+        .scalars()
+        .all()
+    )
+    return samples
 
 
-def _send_result_email(sample: Sample, result_files: List[str]):
-    try:
-        logger.info(f"Sending {sample.primary_key} result email to {sample.email}")
-        msg = EmailMessage()
-        msg.set_content(
-            f"Dear {sample.email},\n\n"
-            f"Your sample {sample.primary_key}_{sample.name} has been processed "
-            f"and the results are attached to this email.\n\n"
+def _send_result_email(sample: Sample, success: bool) -> Tuple[str, int]:
+    message_head = (
+        f"Dear {sample.email},\n\n"
+        f"Your sample {sample.primary_key}_{sample.name} has been processed"
+    )
+    if success:
+        message_body = (
+            f", however no correct de-novo assembly has been determined.\n\n"
+            f"Please consider handing in this sample next week again.\n\n"
+        )
+    else:
+        message_body = (
+            f" and the results are attached to this email.\n\n"
             f"You can also download the full analysis data by "
             f"logging in to your account at https://circuitseq.iwr.uni-heidelberg.de\n\n"
-            f"Best wishes,\n\n"
-            f"CircuitSEQ Team."
         )
+    message_tail = (
+        "Best wishes,\n\nCircuitSEQ Team.\nhttps://circuitseq.iwr.uni-heidelberg.de"
+    )
+    try:
+        logger.info(
+            f"Sending {sample.primary_key} success={success} result email to {sample.email}"
+        )
+        msg = EmailMessage()
+        msg.set_content(f"{message_head}{message_body}{message_tail}")
         msg[
             "Subject"
         ] = f"CircuitSEQ results for sample {sample.primary_key}_{sample.name}"
         msg["From"] = "no-reply@circuitseq.iwr.uni-heidelberg.de"
         msg["To"] = sample.email
-        for result_file in result_files:
-            with open(result_file, "rb") as fp:
-                result_file_data = fp.read()
-            msg.add_attachment(
-                result_file_data,
-                maintype="application",
-                subtype="octet-stream",
-                filename=result_file.split("/")[-1],
-            )
+        if success is True:
+            for filetype in ["fasta", "gbk"]:
+                result_file = sample.results_file_path(filetype)
+                with open(result_file, "rb") as fp:
+                    result_file_data = fp.read()
+                msg.add_attachment(
+                    result_file_data,
+                    maintype="application",
+                    subtype="octet-stream",
+                    filename=result_file.split("/")[-1],
+                )
         with smtplib.SMTP("email:587") as s:
             s.send_message(msg)
     except Exception as e:
         logger.warning(f"  --> failed to send result email: {e}")
-
-
-def process_result(result_zip_file: FileStorage, data_path: str) -> Tuple[str, int]:
-    logger.info(f"Processing zip file {result_zip_file}")
-    results_dir, key = _results_dir_and_key_from_filename(
-        result_zip_file.filename, data_path
+        return (
+            f"Failed to send results email for {sample.primary_key} to {sample.email}: {e}",
+            401,
+        )
+    return (
+        f"Results email for {sample.primary_key} sent to {sample.email}",
+        200,
     )
-    if results_dir == "":
-        logger.warning(f" --> Invalid filename")
-        return f"Invalid filename {result_zip_file.filename}", 401
+
+
+def _is_valid_filename(primary_key: str, filename: str) -> bool:
+    segments = pathlib.Path(filename).name.split("_")
+    if len(segments) < 3:
+        return False
+    yy = segments[0]
+    ww = segments[1]
+    nn = segments[2]
+    return primary_key == f"{yy}_{ww}_{nn}"
+
+
+def process_result(
+    primary_key: str, success: bool, result_zip_file: Optional[FileStorage]
+) -> Tuple[str, int]:
     sample = db.session.execute(
-        db.select(Sample).filter_by(primary_key=key)
+        db.select(Sample).filter_by(primary_key=primary_key)
     ).scalar_one_or_none()
     if sample is None:
         logger.warning(f" --> Unknown primary key {key}")
-        return f"Unknown primary key {key}", 401
+        return f"Unknown primary key {primary_key}", 401
+    if success is False:
+        logger.info("Sending result failure message for {primary_key}")
+        return _send_result_email(sample, success)
+    if not _is_valid_filename(primary_key, result_zip_file.filename):
+        return (
+            f"Zip filename {result_zip_file.filename} doesn't match key {primary_key}",
+            401,
+        )
+    logger.info(f"Processing zip file {result_zip_file} for {primary_key}")
+    results_dir = sample.results_dir()
     pathlib.Path(results_dir).mkdir(parents=True, exist_ok=True)
     basename = f"{key}_{sample.name}"
     results_file = pathlib.Path(results_dir) / f"{basename}.zip"
     result_zip_file.save(results_file)
     logger.info(f"  --> {results_file}")
-    sample.has_results_zip = True
-    files_to_email = []
     try:
         zip_file = zipfile.ZipFile(results_file)
         for zip_info in zip_file.infolist():
             if not zip_info.is_dir():
-                # remove any leading directories from filename in zip file
+                # remove any leading directories from filenames in zip file
                 zip_info.filename = pathlib.Path(zip_info.filename).name
-                result_file = f"{results_dir}/{zip_info.filename}"
-                if zip_info.filename == f"{basename}.fasta":
-                    zip_file.extract(zip_info, results_dir)
-                    logger.info(f"  --> {result_file}")
-                    sample.has_results_fasta = True
-                    files_to_email.append(result_file)
-                elif zip_info.filename == f"{basename}.gbk":
-                    zip_file.extract(zip_info, results_dir)
-                    logger.info(f"  --> {result_file}")
-                    sample.has_results_gbk = True
-                    files_to_email.append(result_file)
+        zip_filenames = [f.filename for f in zip_file.filelist]
+        for filetype in ["fasta", "gbk"]:
+            filename = f"{basename}.{filetype}"
+            if filename not in zip_filenames:
+                logger.warning(f"{filename} not in {zip_filenames}")
+                return (
+                    f"Zip file does not contain {filename}",
+                    401,
+                )
+            zip_file.extract(filename, results_dir)
+            logger.info(f"  --> {results_dir}/{filename}")
     except Exception as e:
         logger.warning(f"Failed to process zip file: {e}")
-    _send_result_email(sample, files_to_email)
+        return (
+            f"Failed to process zip file: {e}",
+            401,
+        )
+    sample.has_results_fasta = True
+    sample.has_results_gbk = True
+    sample.has_results_zip = True
     db.session.commit()
-    return str(results_file), 200
+    email_message, _ = _send_result_email(sample, success, files_to_email)
+    return f"{results_file} saved, {email_message}", 200
 
 
 @dataclass
@@ -390,9 +445,9 @@ def add_new_sample(
     running_option: str,
     concentration: int,
     reference_sequence_file: Optional[FileStorage],
-    data_path: str,
 ) -> Tuple[Optional[Sample], str]:
     today = datetime.date.today()
+    base_path = _get_basepath(today)
     year, week, day = today.isocalendar()
     count = _count_samples_this_week(today)
     settings = get_current_settings()
@@ -409,7 +464,7 @@ def add_new_sample(
     if key is None:
         return None, "No more samples left this week."
     reference_sequence_description: Optional[str] = None
-    ref_seq_dir = pathlib.Path(f"{data_path}/{year}/{week}/inputs/references")
+    ref_seq_dir = pathlib.Path(f"{base_path}/inputs/references")
     ref_seq_dir.mkdir(parents=True, exist_ok=True)
     if reference_sequence_file is not None:
         ref_seq_filename = str(ref_seq_dir / f"{key}_{name}.fasta")
